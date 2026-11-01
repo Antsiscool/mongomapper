@@ -66,69 +66,54 @@ describe "Plugins" do
       end
     end
 
-    context "descendants and garbage collection" do
-      # Built in a separate method so no references stay on the stack
-      def discarded_classes(count, &block)
-        Array.new(count) { WeakRef.new(block.call) }
+    # Whether a class is actually GC'd depends on the Ruby / Rails version and platform,
+    # so these check that MongoMapper only ever holds weak references instead
+    context "descendants" do
+      def stored_refs(owner)
+        list = owner.instance_variable_get(:@direct_descendants)
+        list ? list.instance_variable_get(:@refs) : []
       end
 
-      def collect_garbage
-        4.times { GC.start(full_mark: true, immediate_sweep: true) }
+      it "should hold classes that include Document as weak references" do
+        model = Doc()
+        MongoMapper::Document.direct_descendants.to_a.should include(model)
+        stored_refs(MongoMapper::Document).should_not be_empty
+        stored_refs(MongoMapper::Document).each { |ref| ref.should be_a(WeakRef) }
       end
 
-      # Older ActiveSupport keeps its own strong registry, which the Rails reloader clears
-      def forget_in_active_support(klass)
-        tracker = ActiveSupport::DescendantsTracker
-        return unless tracker.class_variable_defined?(:@@direct_descendants)
-        tracker.class_variable_get(:@@direct_descendants).delete(klass)
-      end
-
-      def reload_model
-        if defined?(::PluginsReloadModel)
-          forget_in_active_support(PluginsReloadModel)
-          Object.send(:remove_const, :PluginsReloadModel)
-        end
-        Object.class_eval <<-RUBY
-          class PluginsReloadModel; include MongoMapper::Document; end
-          class PluginsReloadModel::Child < PluginsReloadModel; end
-        RUBY
-        PluginsReloadModel
-      end
-
-      after do
-        Object.send(:remove_const, :PluginsReloadModel) if defined?(::PluginsReloadModel)
-      end
-
-      it "should not keep discarded Document classes alive" do
-        refs = discarded_classes(20) { Class.new { include MongoMapper::Document } }
-        collect_garbage
-        refs.count(&:weakref_alive?).should < 5
-      end
-
-      it "should not keep discarded subclasses alive" do
+      it "should hold subclasses as weak references, or not at all when Ruby tracks them" do
         parent = Doc()
-        refs = discarded_classes(20) { Class.new(parent) }
-        forget_in_active_support(parent)
-        collect_garbage
-        refs.count(&:weakref_alive?).should < 5
-        parent.direct_descendants.to_a.size.should < 5
+        child = Class.new(parent)
+        parent.direct_descendants.to_a.should == [child]
+        stored_refs(parent).each { |ref| ref.should be_a(WeakRef) }
+        stored_refs(parent).should be_empty if MongoMapper::Plugins::NATIVE_SUBCLASSES
       end
 
-      it "should not keep reloaded classes alive" do
-        refs = discarded_classes(20) { reload_model }
-        current = reload_model
-        collect_garbage
-        refs.count(&:weakref_alive?).should < 5
-        current.direct_descendants.to_a.should == [PluginsReloadModel::Child]
-        MongoMapper::Document.direct_descendants.to_a.should include(current)
+      it "should not keep a global registry of classes" do
+        Class.new(Doc())
+        MongoMapper::Plugins.instance_variables.should be_empty
       end
 
-      it "should still add plugins to classes that are alive" do
-        model = reload_model
-        collect_garbage
+      it "should skip and drop classes that have been garbage collected" do
+        collected = Object.new
+        def collected.__getobj__
+          raise WeakRef::RefError
+        end
+
+        model = Doc()
+        list = MongoMapper::Plugins::DescendantsArray.new
+        list << model
+        list.instance_variable_get(:@refs).unshift(collected)
+
+        list.to_a.should == [model]
+        list.instance_variable_get(:@refs).size.should == 1
+      end
+
+      it "should add plugins to existing subclasses" do
+        child = Class.new(Doc())
         MongoMapper::Document.plugin(MyConcern)
-        model.should respond_to(:class_foo)
-        model::Child.new.should respond_to(:instance_foo)
+        child.should respond_to(:class_foo)
+        child.new.should respond_to(:instance_foo)
         MongoMapper::Document.plugins.delete(MyConcern)
       end
     end
