@@ -1,14 +1,35 @@
 # encoding: UTF-8
+require 'weakref'
+
 module MongoMapper
   module Plugins
-    if defined?(ActiveSupport::DescendantsTracker::DescendantsArray)
-      DescendantsArray = ::ActiveSupport::DescendantsTracker::DescendantsArray
-    else
-      DescendantsArray = ::Array
-    end
+    # Ruby 3.1+ tracks subclasses natively (and weakly)
+    NATIVE_SUBCLASSES = Gem::Version.new(RUBY_VERSION) >= Gem::Version.new('3.1')
 
-    def self.direct_descendants_hash
-      @direct_descendants_hash ||= Hash.new { |h,k| h[k] = DescendantsArray.new }
+    # Holds weak references so classes dropped by code reloading can be GC'd
+    class DescendantsArray
+      include Enumerable
+
+      def initialize
+        @refs = []
+      end
+
+      def <<(klass)
+        @refs << WeakRef.new(klass)
+        self
+      end
+
+      def each
+        @refs.reject! do |ref|
+          begin
+            yield ref.__getobj__
+            false
+          rescue WeakRef::RefError
+            true
+          end
+        end
+        self
+      end
     end
 
     def plugins
@@ -23,7 +44,8 @@ module MongoMapper
     end
 
     def direct_descendants
-      Plugins.direct_descendants_hash[self]
+      return subclasses if NATIVE_SUBCLASSES && is_a?(Class)
+      @direct_descendants ||= DescendantsArray.new
     end
 
     def included(base = nil)
@@ -32,7 +54,7 @@ module MongoMapper
     end
 
     def inherited(subclass)
-      direct_descendants << subclass
+      direct_descendants << subclass unless NATIVE_SUBCLASSES
       super
     end
   end
