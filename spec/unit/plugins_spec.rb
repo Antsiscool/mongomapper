@@ -76,8 +76,18 @@ describe "Plugins" do
         4.times { GC.start(full_mark: true, immediate_sweep: true) }
       end
 
+      # Older ActiveSupport keeps its own strong registry, which the Rails reloader clears
+      def forget_in_active_support(klass)
+        tracker = ActiveSupport::DescendantsTracker
+        return unless tracker.class_variable_defined?(:@@direct_descendants)
+        tracker.class_variable_get(:@@direct_descendants).delete(klass)
+      end
+
       def reload_model
-        Object.send(:remove_const, :PluginsReloadModel) if defined?(::PluginsReloadModel)
+        if defined?(::PluginsReloadModel)
+          forget_in_active_support(PluginsReloadModel)
+          Object.send(:remove_const, :PluginsReloadModel)
+        end
         Object.class_eval <<-RUBY
           class PluginsReloadModel; include MongoMapper::Document; end
           class PluginsReloadModel::Child < PluginsReloadModel; end
@@ -98,6 +108,7 @@ describe "Plugins" do
       it "should not keep discarded subclasses alive" do
         parent = Doc()
         refs = discarded_classes(20) { Class.new(parent) }
+        forget_in_active_support(parent)
         collect_garbage
         refs.count(&:weakref_alive?).should < 5
         parent.direct_descendants.to_a.size.should < 5
